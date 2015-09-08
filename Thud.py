@@ -5,6 +5,12 @@ import datetime
 import random
 import string
 
+#database testing stuff
+import sqlite3
+from pathlib import Path
+import json
+from types import *
+
 logging.basicConfig(filename='ThudLog.log', level=logging.DEBUG)
 
 
@@ -132,11 +138,12 @@ class GameManager(object):
 
     def start_game(self, player_one, player_two):
         """
-        Generates a game token, and individual player tokens for authentication
+        Generates a game token and individual player tokens for authentication. Saves the new game to the database.
         """
         game = Game(player_one, player_two)
         game_token = self.generate_game_token(game)
         self.active_games[game_token] = game
+        self.save_game(game_token,player_one,player_two)
         logging.debug("{}: Game {} start with players {}, {}".format(
             datetime.datetime.now().strftime('%d/%m/%y %H:%M:%S'), game_token, game.player_one.token,
             game.player_two.token))
@@ -161,10 +168,99 @@ class GameManager(object):
         except KeyError:
             return False
 
+    def save_game(self, game_id, *players):
+        '''
+        Manages game saves. Saves gametoken, player1, player2, turn number, and the game board state to sql database.
+        Executed upon game creation in Thud.GameManager.start_game and every turn in Thud.GameManager.process_move.
+        It might be possible to ignore the json conversion entirely and load the string from self.report_game_state(game_id) directly
+        to the database. Although serializing data into a single cell is generally frowned upon for SQL, I think it's okay to do it in
+        this case because there's never an instance where we'd only want to retrieve parts of the board.
+        '''
+        # ToDo: 1) Saving all the game data: player names, races, possibly turn history, etc. 2) Figure out how to handle changing players in a game
+        # 3) Break up repetitive work into new methods (e.g. loading database). 1) Exception catching for: connecting to database, writing to database, closing database.
+        game_state = json.dumps(self.report_game_state(game_id), separators=(',', ': ')) # Production: Compact encoding.
+        gamedbpath = Path('.\games.db')
+        turn = len(self.active_games[game_id].move_history)
+        player_one = self.active_games[game_id].player_one.token
+        player_two = self.active_games[game_id].player_two.token
+
+        # Create the sqlite database if it doesn't exist and connect to it. There also might be a cleaner way to do this part.
+        if not gamedbpath.is_file():
+            game_db = sqlite3.connect('.\games.db')
+            c_game_db = game_db.cursor()
+            c_game_db.execute('''CREATE TABLE Games (gametoken text, player1 text, player2 text, turn int, board text)''')
+        else:
+            game_db = sqlite3.connect('.\games.db')
+            c_game_db = game_db.cursor()
+
+        c_game_db.execute("SELECT ROWID FROM Games WHERE gametoken = (?) ",(game_id,))
+        rowid = c_game_db.fetchone()
+
+        if rowid:
+            print("Saving Game")
+            c_game_db.execute("UPDATE Games SET board = (?) WHERE ROWID = (?)",(game_state,rowid[0]))
+            c_game_db.execute("UPDATE Games SET turn = (?) WHERE ROWID = (?)",(turn,rowid[0]))
+            c_game_db.execute("UPDATE Games SET player1 = (?) WHERE ROWID = (?)",(player_one,rowid[0]))
+            c_game_db.execute("UPDATE Games SET player2 = (?) WHERE ROWID = (?)",(player_two,rowid[0]))
+        else:
+            # Assuming this is only done upon game creation, we need to run tests to make sure this is okay
+            print("Creating Game")
+            c_game_db.execute("INSERT INTO Games VALUES (?,?,?,?,?)",(game_id,player_one,player_two,0,game_state))
+
+        game_db.commit()
+        game_db.close()
+    
+    def load_game(self, game_id):
+        '''
+        Retrieves player tokens the turn number, and board from database. We need to write a read_game_state
+        method that does the reverse of GameManager.report_game_state so that the board is usable by the game engine.
+        '''
+        # ToDo: In addition to stuff from save_game: Exception catching for: can't find requested game token, closing
+        # database, converting game board to engine readable.
+        try:
+            game_db = sqlite3.connect('.\games.db')
+        except:
+            print("Error accessing the database.")
+        c_game_db = game_db.cursor()
+
+        c_game_db.execute("SELECT player1 FROM Games WHERE gametoken = (?) ",(game_id,))
+        player_one = c_game_db.fetchone()[0]
+        c_game_db.execute("SELECT player2 FROM Games WHERE gametoken = (?) ",(game_id,))
+        player_two = c_game_db.fetchone()[0]
+        c_game_db.execute("SELECT turn FROM Games WHERE gametoken = (?) ",(game_id,))
+        turn = c_game_db.fetchone()[0]
+        c_game_db.execute("SELECT board FROM Games WHERE gametoken = (?) ",(game_id,))
+        game_state = json.loads(c_game_db.fetchone()[0])
+
+        self.active_games[game_id] = Game(player_one,player_two)
+        self.read_game_state(game_id,game_state)
+        self.active_games[game_id].move_history = [None] * turn
+        self.active_games[game_id].player_one.token = player_one
+        self.active_games[game_id].player_two.token = player_two
+
+        game_db.close()
+    
+    def read_game_state(self, game_id, game_state):
+        game_board = self.active_games[game_id].board
+
+        for x, column in enumerate(self.active_games[game_id].board):
+            before = str(self.active_games[game_id].board[x])
+            for y, square in enumerate(column):
+                if game_state[str(x)][y]['type'] == 'null':
+                    square = 0
+                elif game_state[str(x)][y]['type'] == 'open':
+                    square = str(x) + ',' + str(y)
+                else:
+                    square.type = game_state[str(x)][y]['type']
+                    square.id = game_state[str(x)][y]['id']
+            after = str(self.active_games[game_id].board[x])
+
     def report_game_state(self, game_id):
         """
         Returns a json representation of the current game state
         """
+        # This method has some weird ass behaviors, sometimes the id and the type get switched in order for no apparent reason and the rows
+        # are never in order due to using board_state[str(x)]
         board_state = {}
         for x, column in enumerate(self.active_games[game_id].board):
             row_state = []
@@ -196,6 +292,8 @@ class GameManager(object):
                 logging.debug("{}: Game {} found, attempting move from {} to {}.".format(
                     game_token, datetime.datetime.now().strftime('%d/%m/%y %H:%M:%S'), start, destination))
                 game = self.active_games[game_token]
+                # Added turn by turn saving here, I figured it didn't belong in the "Game" object.
+                self.save_game(game_token)
                 return game.execute_move(player_token, start, destination, test)
             else:
                 logging.debug("{}: Game {} not found.".format(game_token,
